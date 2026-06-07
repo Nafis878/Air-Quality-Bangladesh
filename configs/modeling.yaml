@@ -1,0 +1,43 @@
+# ============================================================================
+# Forecasting-study configuration (consumed by src/modeling).
+# Leakage-safe: temporal splits + train-only scaler; test used once for reporting.
+# ============================================================================
+
+clean_parquet: "data/processed/air_quality_clean.parquet"
+data_config: "config.yaml"          # reuse split boundaries from the pipeline config
+
+seq_len: 24
+horizons: [1, 6, 24]
+quantiles: [0.1, 0.5, 0.9]
+
+# Station set is resolved from TRAIN coverage (see channels.resolve_station_set).
+station_min_train_obs_rate: 0.30
+station_min_test_obs_rate: 0.05
+
+# Anchor subsampling (controls dataset size / compute). stride=1 uses every hour.
+stride:
+  train: 3        # every 3rd hour as an anchor (cuts train windows ~3x; documented)
+  val: 1
+  test: 1
+
+# Training
+d_model: 64
+n_heads: 4
+batch_size: 128
+lr: 0.001
+max_epochs: 30
+patience: 5             # early stop on val masked-quantile loss
+grad_clip: 1.0
+seeds: [0, 1, 2, 3, 4]  # >=5 seeds
+
+# Quick smoke mode (overrides applied by run.py --quick)
+quick:
+  stride: {train: 48, val: 24, test: 24}
+  max_epochs: 2
+  seeds: [0]
+
+paths:
+  checkpoints: "results/checkpoints"
+  tables: "results/tables"
+  figures: "results/figures"
+  report: "results/methods_results.md"

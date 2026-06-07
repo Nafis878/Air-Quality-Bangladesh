@@ -10,4 +10,11 @@ __pycache__/
 data/interim/
 data/processed/
 
+# Generated model results (regenerate via `python -m src.modeling.run`)
+results/
+gamma_results.zip
+
+# Provenance copies of the invalid checkpoints — not redistributed (see memory note)
+extracted_pth/
+
 # Keep the human-readable report and its figures (data/reports/ is tracked)

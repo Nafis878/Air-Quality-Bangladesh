@@ -26,6 +26,10 @@ PROVENANCE = ["source_year_file"]
 NUMERIC_COLS = POLLUTANTS + MET + DERIVED
 CANONICAL_COLS = ID_COLS + POLLUTANTS + MET + DERIVED + PROVENANCE
 
+# The 16 channels the forecasting models predict (pollutants + meteorology).
+# `ratio` (DERIVED) is excluded — it is a near-empty derived quantity, not a forecast target.
+MODEL_CHANNELS = POLLUTANTS + MET
+
 # Columns whose units differ from the obvious default — documented, never auto-converted.
 UNIT_NOTES = {
     "so2": "ppb", "no": "ppb", "no2": "ppb", "nox": "ppb", "o3": "ppb",
