@@ -37,7 +37,8 @@ def collect_predictions(name, model, arr, anchors, scaler, cfg, device="cpu") ->
 
     if is_gamma(name):
         ds = CrossSectionDataset(arr, anchors, cfg["seq_len"], horizons)
-        loader = DataLoader(ds, batch_size=cfg["batch_size"], shuffle=False)
+        loader = DataLoader(ds, batch_size=cfg["batch_size"], shuffle=False,
+                            num_workers=int(cfg.get("num_workers", 0)))
         i0 = 0
         for batch in loader:
             x = batch["x"].to(device); mask = batch["mask"].to(device)
@@ -57,7 +58,8 @@ def collect_predictions(name, model, arr, anchors, scaler, cfg, device="cpu") ->
                 }))
     else:
         ds = StationWindowDataset(arr, anchors, cfg["seq_len"], horizons)
-        loader = DataLoader(ds, batch_size=cfg["batch_size"], shuffle=False)
+        loader = DataLoader(ds, batch_size=cfg["batch_size"], shuffle=False,
+                            num_workers=int(cfg.get("num_workers", 0)))
         i0 = 0
         for batch in loader:
             x = batch["x"].to(device)

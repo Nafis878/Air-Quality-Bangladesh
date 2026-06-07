@@ -146,6 +146,7 @@ def main():
     ap.add_argument("--seeds", default=None, help="override seeds, comma list e.g. 0,1,2,3,4")
     ap.add_argument("--max-epochs", type=int, default=None, help="override max epochs")
     ap.add_argument("--batch-size", type=int, default=None, help="override batch size")
+    ap.add_argument("--num-workers", type=int, default=None, help="DataLoader workers (GPU: try 4)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -161,7 +162,13 @@ def main():
         cfg["batch_size"] = args.batch_size
     seeds = cfg["seeds"]
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
-    print(f"== device: {device} ==")
+    # GPU is data-loading bound for the small baselines -> parallelize batch assembly.
+    if args.num_workers is not None:
+        cfg["num_workers"] = args.num_workers
+    elif device == "cuda":
+        cfg["num_workers"] = 4
+    cfg["pin_memory"] = (device == "cuda")
+    print(f"== device: {device} | num_workers: {cfg.get('num_workers', 0)} ==")
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(os.path.join(args.out, "tables"), exist_ok=True)
 

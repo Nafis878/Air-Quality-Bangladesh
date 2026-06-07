@@ -47,14 +47,17 @@ def build_model(name: str, n_stations: int, cfg: dict, gamma_kwargs: dict | None
 def make_loaders(name: str, prep, cfg: dict):
     seq, hz = cfg["seq_len"], cfg["horizons"]
     stride = cfg["stride"]
+    nw = int(cfg.get("num_workers", 0))
+    pin = bool(cfg.get("pin_memory", False))
     Dset = CrossSectionDataset if is_gamma(name) else StationWindowDataset
     loaders = {}
     for split in ("train", "val", "test"):
         arr = prep.arrays[split]
         anc = valid_anchors(arr, seq, hz, stride=stride[split])
         ds = Dset(arr, anc, seq, hz)
-        loaders[split] = DataLoader(ds, batch_size=cfg["batch_size"],
-                                    shuffle=(split == "train"), num_workers=0)
+        loaders[split] = DataLoader(
+            ds, batch_size=cfg["batch_size"], shuffle=(split == "train"),
+            num_workers=nw, pin_memory=pin, persistent_workers=(nw > 0))
     return loaders
 
 
