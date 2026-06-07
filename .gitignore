@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Raw data — not redistributed; place locally per config.yaml
+*.xlsx
+
+# Generated artifacts — reproducible via `python -m src.build --config config.yaml`
+data/interim/
+data/processed/
+
+# Keep the human-readable report and its figures (data/reports/ is tracked)

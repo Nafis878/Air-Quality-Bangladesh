@@ -1,0 +1,58 @@
+# ============================================================================
+# Air-Quality data pipeline configuration
+# Everything reproducible from this file + a fixed seed.
+# Run: python -m src.build --config config.yaml
+# ============================================================================
+
+seed: 42
+
+# --- Inputs ------------------------------------------------------------------
+# Real files live in the project root with spaces in their names (not data/raw).
+# We read them in place; we never rename/move the user's only copy.
+raw_files:
+  - path: "2012-2021 Air.xlsx"
+    sheet: "2012-2021"
+    label: "2012-2021"
+  - path: "2022 Air.xlsx"
+    sheet: "2022"
+    label: "2022"
+  - path: "2023 Air.xlsx"
+    sheet: "2023 air"
+    label: "2023"
+  - path: "2024 Air.xlsx"
+    sheet: "2024"
+    label: "2024"
+
+# --- Outputs -----------------------------------------------------------------
+paths:
+  interim_dir: "data/interim"
+  processed_dir: "data/processed"
+  reports_dir: "data/reports"
+  figures_dir: "data/reports/figures"
+  merged_raw: "data/interim/merged_raw.parquet"
+  clean: "data/processed/air_quality_clean.parquet"
+  features: "data/processed/air_quality_features.parquet"
+  report_md: "data/reports/data_quality_report.md"
+
+# --- Datetime ----------------------------------------------------------------
+# Network is Asia/Dhaka local time, no DST. Timestamps stored tz-naive.
+excel_origin: "1899-12-30"   # Excel serial-date epoch
+timezone: "Asia/Dhaka"
+
+# --- Temporal split (leakage-safe; never shuffle) ----------------------------
+# Inclusive year boundaries. Scalers/imputers fit on train only.
+split:
+  train_end: "2022-12-31 23:59:59"
+  val_end:   "2023-12-31 23:59:59"
+  # everything after val_end is test
+
+# --- Hourly reindex ----------------------------------------------------------
+reindex:
+  freq: "1h"
+  # max consecutive-gap (hours) the fold-aware imputer is allowed to fill
+  max_impute_gap: 6
+
+# --- Outlier flagging (flag, never clip) -------------------------------------
+outlier:
+  method: "iqr"        # per-station robust IQR fence
+  iqr_k: 3.0           # fence = Q1 - k*IQR .. Q3 + k*IQR
