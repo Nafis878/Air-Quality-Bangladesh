@@ -20,9 +20,9 @@ from scipy import stats
 
 from .channels import CHANNELS, HORIZONS
 from .dataprep import prepare, load_config
-from .train import train_model, build_model, count_params, is_gamma
-from .evaluate import (collect_predictions, metrics_by_horizon, pm25_frame,
-                       diebold_mariano, holm_bonferroni)
+from .fasttrain import train_model, collect_predictions
+from .train import build_model, count_params, is_gamma
+from .evaluate import metrics_by_horizon, pm25_frame, diebold_mariano, holm_bonferroni
 from .models.baselines import BASELINES
 from .models.naive import NaiveForecasters, NAIVE_METHODS
 from .windows import valid_anchors, StationWindowDataset
@@ -55,14 +55,12 @@ def summarize_seeds(per_seed_metrics: list[dict], horizons) -> list[dict]:
 
 def train_and_eval_model(name, prep, cfg, seeds, device, gamma_kwargs=None, verbose=False):
     """Train across seeds; return (summary_rows, seed_mean_pm25_df, n_params, val_losses)."""
-    test_arr = prep.arrays["test"]
-    test_anchors = valid_anchors(test_arr, cfg["seq_len"], cfg["horizons"], stride=cfg["stride"]["test"])
     per_seed_metrics, pm25_per_seed, val_losses, n_params = [], [], [], None
     for seed in seeds:
         t0 = time.time()
         res = train_model(name, prep, cfg, seed, gamma_kwargs=gamma_kwargs, device=device, verbose=verbose)
         n_params = res["n_params"]; val_losses.append(res["val_loss"])
-        pred = collect_predictions(name, res["model"], test_arr, test_anchors, prep.scaler, cfg, device)
+        pred = collect_predictions(name, res["model"], prep, cfg, device)
         per_seed_metrics.append(metrics_by_horizon(pred, cfg["horizons"]))
         pm25_per_seed.append(pred[pred["channel"] == CHANNELS.index("pm25")]
                              [["t", "station", "horizon", "y_true", "y_pred"]])
