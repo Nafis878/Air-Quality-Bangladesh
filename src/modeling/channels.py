@@ -15,6 +15,8 @@ CHANNELS = list(MODEL_CHANNELS)          # 16 forecast channels (pollutants + me
 N_CHANNELS = len(CHANNELS)
 HORIZONS = [1, 6, 24]                    # hours ahead: t+1, t+6, t+24
 PM25_IDX = CHANNELS.index("pm25")        # headline channel
+WIND_DIR_IDX = CHANNELS.index("wind_dir")    # raw degrees (for the wind-transport graph)
+WIND_SPEED_IDX = CHANNELS.index("wind_speed")  # raw m/s
 
 
 def resolve_station_set(

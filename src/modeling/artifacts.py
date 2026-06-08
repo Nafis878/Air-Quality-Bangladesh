@@ -199,6 +199,116 @@ def capability_verdict(payload) -> str:
     return head + "\n\n" + "\n".join(lines)
 
 
+def make_outage_figure(payload, out_path):
+    """PM2.5 MAE at the longest horizon vs simulated self-outage length, per model. GAMMA should
+    rise slowly (recovers from neighbours); persistence + per-station baseline should shoot up."""
+    outage = payload.get("outage", {})
+    if not outage:
+        return
+    h = max(payload["config"]["horizons"])
+    olens = sorted(int(k) for k in outage)
+    models = ["GAMMA", "GAMMA_no_spatial", "persistence"]
+    for k in outage.values():
+        for r in k.get("mae", []):
+            if r["model"] in BASELINES and r["model"] not in models:
+                models.append(r["model"])
+    styles = {"GAMMA": ("#b30000", "-", "o"), "GAMMA_no_spatial": ("#d28b00", ":", "^"),
+              "persistence": ("#777777", "--", "s")}
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for m in dict.fromkeys(models):
+        ys = []
+        for ol in olens:
+            rr = [r for r in outage[str(ol)]["mae"] if r["model"] == m and r["horizon"] == h]
+            ys.append(rr[0]["mae_outage"] if rr else float("nan"))
+        if all(y != y for y in ys):
+            continue
+        c, ls, mk = styles.get(m, ("#4c72b0", "-.", "D"))
+        ax.plot(olens, ys, ls, marker=mk, color=c, label=m, linewidth=2, markersize=7)
+    ax.set_xlabel("Simulated outage length of the target station's own sensor (hours)")
+    ax.set_ylabel(f"PM2.5 MAE at t+{h} under outage  — lower is better")
+    ax.set_title("Forecasting through a sensor outage\n(only GAMMA reads neighbours; baselines/persistence see a dead window)")
+    ax.set_ylim(bottom=0); ax.grid(True, linestyle="--", alpha=0.5); ax.legend()
+    fig.tight_layout(); fig.savefig(out_path, dpi=140); plt.close(fig)
+
+
+def outage_section(payload) -> str:
+    outage = payload.get("outage", {})
+    if not outage:
+        return ""
+    h = max(payload["config"]["horizons"])
+    olens = sorted(int(k) for k in outage)
+    md = [f"\n## Forecasting through sensor outages — PM2.5 MAE at t+{h}\n",
+          "> A FRESH target station's own last *k* input hours are blacked out (sensor dead), "
+          "neighbours intact. GAMMA can route from neighbours; persistence and per-station baselines "
+          "see a dead window. `+Δ` = degradation vs the same fresh points without outage.\n"]
+    # table: rows = models, cols = outage lengths
+    first = outage[str(olens[0])]["mae"]
+    models = [r["model"] for r in first if r["horizon"] == h]
+    md.append("| Model | " + " | ".join(f"k={ol}h" for ol in olens) + " |")
+    md.append("|" + "---|" * (len(olens) + 1))
+    for m in models:
+        cells = []
+        for ol in olens:
+            rr = [r for r in outage[str(ol)]["mae"] if r["model"] == m and r["horizon"] == h]
+            if rr:
+                cells.append(f"{rr[0]['mae_outage']:.1f} (+{rr[0]['degradation']:.1f})")
+            else:
+                cells.append("—")
+        md.append(f"| {m} | " + " | ".join(cells) + " |")
+    # DM at the longest outage
+    longest = outage[str(olens[-1])]["dm"].get(str(h)) or outage[str(olens[-1])]["dm"].get(h)
+    if longest:
+        vp, vb = longest.get("vs_persistence", {}), longest.get("vs_best_baseline", {})
+        def fmt(v):
+            n, p, dmv = v.get("n", 0), v.get("p", float("nan")), v.get("dm", float("nan"))
+            if n and n >= 8 and p == p:
+                return f"GAMMA {'better' if dmv<0 and p<0.05 else ('worse' if dmv>0 and p<0.05 else 'n.s.')} (DM={dmv:.2f}, p={p:.3f}, n={n})"
+            return f"insufficient n ({n})"
+        md.append(f"\nAt k={olens[-1]}h, t+{h}: vs persistence — {fmt(vp)}; vs baseline "
+                  f"{vb.get('competitor')} — {fmt(vb)}.")
+    return "\n".join(md)
+
+
+def coldstart_section(payload) -> str:
+    cs = payload.get("coldstart", {})
+    if not cs or not cs.get("per_horizon"):
+        return ""
+    st = cs.get("station", "?")
+    md = [f"\n## Zero-shot cold-start — nowcasting {st} (never seen in training)\n",
+          f"> {st} is absent from TRAIN, so no per-station baseline has weights for it; only GAMMA "
+          "(inductive: coordinate embedding + coordinate/wind edges) can forecast it, from neighbours. "
+          "Comparator = persistence on the station's own test history.\n",
+          "| Horizon | GAMMA (zero-shot) | persistence | n | DM vs persistence |",
+          "|---|---|---|---|---|"]
+    dm = cs.get("dm", {})
+    for r in cs["per_horizon"]:
+        h = r["horizon"]; d = dm.get(str(h)) or dm.get(h) or {}
+        dmtxt = (f"DM={d['dm']:.2f}, p={d['p']:.3f}, n={d['n']}"
+                 if d and d.get("n", 0) >= 8 and d.get("p") == d.get("p") else "—")
+        md.append(f"| t+{h} | {r['gamma_mae']:.2f} | {r['persistence_mae']:.2f} | {r['n']} | {dmtxt} |")
+    return "\n".join(md)
+
+
+def calibration_section(payload) -> str:
+    cal = payload.get("calibration", {})
+    if not cal:
+        return ""
+    horizons = payload["config"]["horizons"]
+    nominal = next((v[next(iter(v))]["nominal"] for v in cal.values() if v), 0.8)
+    md = [f"\n## Probabilistic calibration — {int(nominal*100)}% PM2.5 interval (PICP / MPIW)\n",
+          "> PICP = empirical coverage (target = nominal); MPIW = mean interval width (µg/m³).\n",
+          "| Model | " + " | ".join(f"t+{h} PICP" for h in horizons) + " |",
+          "|" + "---|" * (len(horizons) + 1)]
+    order = [m for m in LEARNED if m in cal] + [m for m in NAIVE_METHODS if m in cal]
+    for m in order:
+        cells = []
+        for h in horizons:
+            c = cal[m].get(str(h)) or cal[m].get(h)
+            cells.append(f"{c['picp']:.2f}" if c else "—")
+        md.append(f"| {m} | " + " | ".join(cells) + " |")
+    return "\n".join(md)
+
+
 def verdict(payload, agg="macro") -> str:
     """Honest, floor-aware verdict derived from the numbers — covers GAMMA winning, GAMMA
     being worst, and the case where NO learned model beats the naive floors."""
@@ -311,11 +421,17 @@ def write_report(payload, out_path, fig_rel="figures"):
             md.append(f"| {b} | " + " | ".join(cells) + f" | {gn} |")
         md.append("\n_See `figures/staleness_capability.png`._\n")
         md.append(capability_verdict(payload))
+    md.append(outage_section(payload))
+    md.append(coldstart_section(payload))
+    md.append(calibration_section(payload))
     md.append("\n## Limitations\n")
     md.append("- Station coverage is uneven; the 12-station scope excludes sparse/cold-start sites "
               "(CDA/DoE enter late; Agrabad/Sangsad exit 2021; Cumilla/Mymensingh/Savar too sparse).")
     md.append("- Val-vs-test selection: hyperparameters/early-stopping used val (2023); test (2024) untouched.")
     md.append("- Known data caveats carried from the pipeline: PM2.5>PM10 rows flagged-not-fixed; CO in ppm.")
+    md.append("- Station coordinates are EXTERNAL, approximate city/site centroids (data/external/, cited), "
+              "never merged into the cleaned artifact; the `GAMMA_no_geo` ablation reports results without them. "
+              "Wind is ~49% observed, so the wind-transport edge is active only when wind is present.")
     md.append("- CPU budget caps epochs/seeds; absolute errors may improve with longer training.")
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(md))
@@ -328,6 +444,7 @@ def generate_all(results_dir="results"):
     make_primary_figure(payload, os.path.join(figs, "primary_test_mae.png"))
     make_efficiency_figure(payload, os.path.join(figs, "efficiency.png"))
     make_staleness_figure(payload, os.path.join(figs, "staleness_capability.png"))
+    make_outage_figure(payload, os.path.join(figs, "outage_degradation.png"))
     make_latex_table(payload, os.path.join(tabs, "results_table.tex"))
     write_report(payload, os.path.join(results_dir, "methods_results.md"))
     print(f"artifacts written under {results_dir}/")

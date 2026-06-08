@@ -14,9 +14,19 @@ from src.modeling.losses import MaskedQuantileLoss, median_index
 from src.modeling.models.gamma import GAMMA
 from src.modeling.models.naive import NaiveForecasters, _ffill_time
 from src.modeling.metrics import descale
-from src.modeling.evaluate import diebold_mariano, holm_bonferroni, staleness_bin_labels
+from src.modeling.evaluate import diebold_mariano, holm_bonferroni, staleness_bin_labels, calibration
 from src.modeling.fasttrain import _DeviceArrays
+from src.modeling import geo as geomod
 from src.splits import StandardScalerFrame
+
+
+def _geo_for(lat, lon):
+    """(coords[S,2], dist_feats[S,S,2], bearing[S,S]) torch tensors for GAMMA.forward."""
+    lat = np.asarray(lat, dtype=np.float64); lon = np.asarray(lon, dtype=np.float64)
+    dist = geomod.haversine_km(lat, lon); brg = geomod.bearings_deg(lat, lon)
+    dd = np.stack([geomod.distance_decay(dist, s) for s in (50.0, 200.0)], axis=-1)
+    coords = np.stack([lat, lon], axis=-1).astype(np.float32)
+    return (torch.tensor(coords), torch.tensor(dd, dtype=torch.float32), torch.tensor(brg))
 
 
 def _toy_panel(T=60, S=3, C=len(CHANNELS), seed=0):
@@ -73,33 +83,65 @@ def test_pinball_at_median_equals_half_mae():
     assert abs(loss - 0.5 * target.abs().mean().item()) < 1e-6
 
 
-def test_gamma_adjacency_is_live():
-    """The spatial graph's learnable station->station adjacency must get gradient (it routes the
-    cross-station capability into the attention logits)."""
+def test_gamma_learned_adj_is_live_in_fallback():
+    """With no geo (fallback path) the free [n_heads,S,S] adjacency carries the spatial signal and
+    must get gradient."""
     torch.manual_seed(0)
     B, S, L, C = 2, 4, 8, len(CHANNELS)
     model = GAMMA(C, S, d_model=32, n_heads=4, seq_len=L, n_horizons=1, n_quantiles=1)
     x = torch.randn(B, S, L, C); mask = torch.ones(B, S, L, C); decay = torch.zeros(B, S, L, C)
     present = torch.ones(B, S); st = torch.arange(S).unsqueeze(0).repeat(B, 1)
-    out = model(x, mask, decay, present, st)
+    out = model(x, mask, decay, present, st)              # geo=None -> learned_adj path
     out.sum().backward()
-    adj = model.spatial_graph.adjacency
-    assert adj.grad is not None and adj.grad.abs().sum().item() > 0.0
+    assert model.learned_adj.grad is not None and model.learned_adj.grad.abs().sum().item() > 0.0
 
 
-def test_gamma_adjacency_uses_prior_and_is_multihop():
-    """adj_prior seeds the [n_heads,S,S] adjacency; spatial_layers controls the number of hops."""
+def test_geo_distance_and_bearing():
+    """Haversine is symmetric/zero-diagonal; bearings point the right way."""
+    lat = np.array([23.0, 24.0, 23.0]); lon = np.array([90.0, 90.0, 91.0])
+    d = geomod.haversine_km(lat, lon)
+    assert np.allclose(np.diag(d), 0.0) and np.allclose(d, d.T, atol=1e-3)
+    assert abs(d[0, 1] - 111.0) < 3.0                     # ~1 deg lat ~= 111 km
+    brg = geomod.bearings_deg(lat, lon)
+    assert abs(brg[0, 1] - 0.0) < 1.0                     # station1 due NORTH of station0
+    assert abs(brg[0, 2] - 90.0) < 1.0                    # station2 due EAST of station0
+
+
+def test_wind_transport_upwind_boosts_edge():
+    """A source station blowing TOWARD a target strengthens that edge; a source with missing wind
+    contributes nothing. Edge tensor is [B, query i, key j]."""
+    lat = np.array([23.0, 24.0]); lon = np.array([90.0, 90.0])    # station1 north of station0
+    brg = torch.tensor(geomod.bearings_deg(lat, lon))
+    wind_dir = torch.tensor([[180.0, 0.0]])               # s0 wind FROM south (blows north -> s1)
+    wind_speed = torch.tensor([[10.0, 10.0]])
+    wind_mask = torch.tensor([[1.0, 0.0]])                # s1 wind missing
+    bias = geomod.wind_transport_bias(wind_dir, wind_speed, wind_mask, brg)   # [1,2,2]
+    assert bias[0, 1, 0] > 0.5                            # i=s1 pulls strongly from j=s0 (upwind)
+    assert bias[0, 0, 1].abs() < 1e-6                     # j=s1 has no wind -> no edge
+
+
+def test_gamma_inductive_forecasts_unseen_station():
+    """Coordinate-conditioned: a model built for S stations can forecast S+1 (a cold-start node)
+    when geo is supplied — the inductive property that enables zero-shot cold-start."""
     torch.manual_seed(0)
-    S, C = 4, len(CHANNELS)
-    prior = np.random.randn(S, S).astype(np.float32)
-    m = GAMMA(C, S, d_model=32, n_heads=4, seq_len=8, n_horizons=1, n_quantiles=1,
-              spatial_layers=2, adj_prior=prior)
-    # every head initialised to the prior; two stacked spatial blocks (multi-hop)
-    for head in range(4):
-        assert np.allclose(m.spatial_graph.adjacency.detach().numpy()[head], prior, atol=1e-5)
-    assert len(m.spatial_graph.blocks) == 2
-    assert len(GAMMA(C, S, d_model=32, n_heads=4, seq_len=8, n_horizons=1, n_quantiles=1,
-                     spatial_layers=1).spatial_graph.blocks) == 1
+    B, L, C = 2, 8, len(CHANNELS)
+    model = GAMMA(C, num_stations=4, d_model=32, n_heads=4, seq_len=L, n_horizons=2, n_quantiles=3)
+    S = 5                                                 # one MORE station than trained
+    lat = [23.0, 24.0, 25.0, 23.5, 22.5]; lon = [90.0, 90.0, 91.0, 89.5, 90.5]
+    geo = _geo_for(lat, lon)
+    x = torch.randn(B, S, L, C); mask = torch.ones(B, S, L, C); decay = torch.zeros(B, S, L, C)
+    present = torch.ones(B, S); st = torch.arange(S).unsqueeze(0).repeat(B, 1)
+    out = model(x, mask, decay, present, st, geo=geo)     # must not raise; covers the unseen node
+    assert out.shape == (B, S, 2, C, 3)
+
+
+def test_calibration_picp_and_width():
+    df = pd.DataFrame({"y_true": [1.0, 5.0, 9.0, 2.0], "y_lo": [0.0, 4.0, 0.0, 3.0],
+                       "y_hi": [2.0, 6.0, 8.0, 4.0]})
+    c = calibration(df, nominal=0.8)
+    assert abs(c["picp"] - 0.5) < 1e-9                    # 2 of 4 inside [lo,hi]
+    assert abs(c["mpiw"] - ((2 + 2 + 8 + 1) / 4)) < 1e-9
+    assert c["n"] == 4
 
 
 def test_gamma_decay_gate_is_bounded_identity_at_zero():

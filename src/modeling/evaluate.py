@@ -101,6 +101,107 @@ def pm25_frame(pred_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return sub.sort_values(["station", "t"]).reset_index(drop=True)
 
 
+def calibration(df: pd.DataFrame, nominal: float = 0.8) -> dict:
+    """Interval coverage (PICP) and mean width (MPIW) for the [y_lo,y_hi] prediction interval."""
+    if df is None or len(df) == 0 or "y_lo" not in df:
+        return {"picp": float("nan"), "mpiw": float("nan"), "n": 0, "nominal": nominal}
+    lo, hi, yt = df["y_lo"].to_numpy(), df["y_hi"].to_numpy(), df["y_true"].to_numpy()
+    return {"picp": float(((yt >= lo) & (yt <= hi)).mean()), "mpiw": float((hi - lo).mean()),
+            "n": int(len(df)), "nominal": nominal}
+
+
+def calibration_by_model(pm25_by_model: dict, horizons, nominal: float = 0.8) -> dict:
+    """{model: {horizon: calibration(...)}} on PM2.5; only models that carry interval columns."""
+    out = {}
+    for name, df in pm25_by_model.items():
+        if df is None or len(df) == 0 or "y_lo" not in df:
+            continue
+        out[name] = {int(h): calibration(df[df["horizon"] == h], nominal) for h in horizons}
+    return out
+
+
+def outage_summary(outage_by_model: dict, normal_by_model: dict, horizons,
+                   gamma_key="GAMMA", floor_key="persistence", baseline_names=None) -> dict:
+    """Degradation under a simulated self-sensor outage vs the model's own fresh-point MAE, plus DM
+    (GAMMA vs persistence / best baseline) computed on the OUTAGE points. The causal value of
+    neighbours: GAMMA should degrade least; per-station baselines should collapse."""
+    baseline_names = set(baseline_names or [])
+    rows = []
+    for name, odf in outage_by_model.items():
+        ndf = normal_by_model.get(name)
+        for h in horizons:
+            o = odf[odf["horizon"] == h]
+            mae_out = float((o["y_true"] - o["y_pred"]).abs().mean()) if len(o) else float("nan")
+            mae_norm = float("nan")
+            if ndf is not None and len(ndf):
+                nf = ndf[(ndf["horizon"] == h) & (ndf["staleness"] <= 1)]
+                mae_norm = float((nf["y_true"] - nf["y_pred"]).abs().mean()) if len(nf) else float("nan")
+            rows.append({"model": name, "horizon": int(h), "mae_fresh": mae_norm,
+                         "mae_outage": mae_out, "degradation": mae_out - mae_norm, "n": int(len(o))})
+    # best baseline under outage (lowest outage MAE), per horizon
+    best_base = {}
+    for h in horizons:
+        cands = [(r["model"], r["mae_outage"]) for r in rows
+                 if r["model"] in baseline_names and r["horizon"] == h and r["mae_outage"] == r["mae_outage"]]
+        best_base[h] = min(cands, key=lambda x: x[1])[0] if cands else None
+    dm = {}
+    if gamma_key in outage_by_model:
+        g = outage_by_model[gamma_key]
+        for h in horizons:
+            comps = {}
+            gh = g[g["horizon"] == h]
+            for ckey, cname in (("vs_persistence", floor_key), ("vs_best_baseline", best_base.get(h))):
+                if cname is None or cname not in outage_by_model:
+                    comps[ckey] = {"competitor": cname, "dm": float("nan"), "p": float("nan"), "n": 0}
+                    continue
+                c = outage_by_model[cname]; c = c[c["horizon"] == h]
+                merged = gh.merge(c, on=["t", "station", "horizon"], suffixes=("_g", "_c"))
+                if len(merged) < 8:
+                    comps[ckey] = {"competitor": cname, "dm": float("nan"), "p": float("nan"), "n": len(merged)}
+                    continue
+                e_g = merged["y_true_g"].to_numpy() - merged["y_pred_g"].to_numpy()
+                e_c = merged["y_true_c"].to_numpy() - merged["y_pred_c"].to_numpy()
+                dmv, p, n = diebold_mariano(e_g, e_c, h=h)
+                comps[ckey] = {"competitor": cname, "dm": dmv, "p": p, "n": n}
+            dm[int(h)] = comps
+    return {"mae": rows, "best_baseline": best_base, "dm": dm}
+
+
+def coldstart_summary(cold_df: pd.DataFrame, floor_df: pd.DataFrame, horizons, seq_len: int,
+                      edges=(1, 6)) -> dict:
+    """Zero-shot cold-start (GAMMA on an unseen station) vs its persistence floor: overall MAE per
+    horizon, MAE by staleness bin, and DM vs persistence. Only GAMMA can forecast an unseen station."""
+    bins = staleness_bin_labels(seq_len, edges)
+    out = {"per_horizon": [], "by_bin": [], "dm": {}, "calibration": {}}
+    if cold_df is None or len(cold_df) == 0:
+        return out
+    cd = cold_df.copy(); cd["bin"] = _assign_bin(cd["staleness"].to_numpy(), bins)
+    fd = floor_df.copy() if floor_df is not None and len(floor_df) else None
+    for h in horizons:
+        c = cd[cd["horizon"] == h]
+        gmae = float((c["y_true"] - c["y_pred"]).abs().mean()) if len(c) else float("nan")
+        fmae = float("nan")
+        if fd is not None:
+            f = fd[fd["horizon"] == h]
+            fmae = float((f["y_true"] - f["y_pred"]).abs().mean()) if len(f) else float("nan")
+        out["per_horizon"].append({"horizon": int(h), "gamma_mae": gmae, "persistence_mae": fmae,
+                                   "n": int(len(c))})
+        out["calibration"][int(h)] = calibration(c)
+        for b in [bb[0] for bb in bins]:
+            cb = c[c["bin"] == b]
+            out["by_bin"].append({"horizon": int(h), "bin": b,
+                                  "gamma_mae": float((cb["y_true"] - cb["y_pred"]).abs().mean()) if len(cb) else float("nan"),
+                                  "n": int(len(cb))})
+        if fd is not None:
+            merged = c.merge(fd[fd["horizon"] == h], on=["t", "station", "horizon"], suffixes=("_g", "_f"))
+            if len(merged) >= 8:
+                e_g = merged["y_true_g"].to_numpy() - merged["y_pred_g"].to_numpy()
+                e_f = merged["y_true_f"].to_numpy() - merged["y_pred_f"].to_numpy()
+                dmv, p, nn = diebold_mariano(e_g, e_f, h=h)
+                out["dm"][int(h)] = {"dm": dmv, "p": p, "n": nn}
+    return out
+
+
 def staleness_bin_labels(seq_len: int, edges=(1, 6)) -> list[tuple[str, float, float]]:
     """Pre-registered bins by input-side PM2.5 staleness (hours since the station last reported).
 

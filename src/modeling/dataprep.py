@@ -14,6 +14,7 @@ import yaml
 
 from .channels import CHANNELS, resolve_station_set
 from .windows import PanelArrays, build_panel_arrays
+from . import geo as geomod
 from ..splits import temporal_split, fit_scaler
 from ..schema import MODEL_CHANNELS
 
@@ -26,6 +27,22 @@ class Prepared:
     scaler: object
     arrays: dict[str, PanelArrays]      # 'train' / 'val' / 'test'
     splits: dict[str, pd.DataFrame]
+    geo: dict | None = None             # coords/dist/bearing for the resolved station order
+
+
+def build_geo(stations: list[str], coords_path: str,
+              length_scales=(50.0, 200.0)) -> dict:
+    """Inductive geo tensors aligned to `stations`: coords[S,2], dist_feats[S,S,2] (two decay
+    scales), bearing[S,S]. From EXTERNAL approximate coordinates (see data/external/README)."""
+    lat, lon, missing = geomod.load_coords(coords_path, stations)
+    if missing:
+        print(f"[geo] WARNING: no coordinates for {missing} — those rows get NaN (graph falls back).")
+    dist = geomod.haversine_km(lat, lon)
+    brg = geomod.bearings_deg(lat, lon)
+    dd = np.stack([geomod.distance_decay(dist, ls) for ls in length_scales], axis=-1)  # [S,S,2]
+    coords = np.stack([lat, lon], axis=-1).astype(np.float32)
+    return {"coords": coords, "dist_feats": dd.astype(np.float32),
+            "bearing": brg.astype(np.float32), "dist_km": dist, "missing": missing}
 
 
 def load_config(path: str) -> dict:
@@ -54,7 +71,25 @@ def prepare(model_cfg: dict, nrows: int | None = None) -> Prepared:
         name: build_panel_arrays(splits[name], stations, scaler, CHANNELS)
         for name in ("train", "val", "test")
     }
-    return Prepared(model_cfg, stations, excluded, scaler, arrays, splits)
+    geo = build_geo(stations, model_cfg.get("coords_path", "data/external/station_coords.csv"))
+    return Prepared(model_cfg, stations, excluded, scaler, arrays, splits, geo)
+
+
+def build_cold_start(prep: Prepared, cold_station: str = "DoE") -> dict | None:
+    """Build a TEST cross-section that appends an unseen `cold_station` to the trained stations.
+
+    Returns {arr, geo, cold_index, station_list} or None if the station has no test rows. The model
+    is inductive (coord-MLP embedding + coordinate/wind edges), so it can forecast `cold_station`
+    despite never training on it. Per-station baselines have no weights for it and cannot.
+    """
+    test_df = prep.splits["test"]
+    if cold_station not in set(test_df["station"]):
+        return None
+    stations = list(prep.stations) + [cold_station]
+    arr = build_panel_arrays(test_df, stations, prep.scaler, CHANNELS)
+    geo = build_geo(stations, prep.cfg.get("coords_path", "data/external/station_coords.csv"))
+    return {"arr": arr, "geo": geo, "cold_index": len(prep.stations),
+            "station_list": stations, "cold_station": cold_station}
 
 
 def inter_station_corr(train_arr: PanelArrays, channel: str = "pm25") -> np.ndarray:

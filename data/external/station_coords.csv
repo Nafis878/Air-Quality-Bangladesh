@@ -1,0 +1,14 @@
+station,lat,lon,city,approximate,note
+BARC,23.759,90.388,Dhaka,1,Bangladesh Agricultural Research Council site (Farmgate area)
+Barishal,22.701,90.353,Barishal,1,city centroid
+CDA,22.358,91.832,Chittagong,1,Chittagong Development Authority area
+Darussalam,23.785,90.355,Dhaka,1,Mirpur/Darussalam area
+Gazipur,23.999,90.420,Gazipur,1,city centroid
+Khulna,22.845,89.540,Khulna,1,city centroid
+Narayanganj,23.624,90.500,Narayanganj,1,city centroid
+Narsingdi,23.920,90.715,Narsingdi,1,city centroid
+Rajshahi,24.374,88.604,Rajshahi,1,city centroid
+Rangpur,25.744,89.275,Rangpur,1,city centroid
+Sylhet,24.895,91.870,Sylhet,1,city centroid
+TV_Center,23.762,90.421,Dhaka,1,Dhaka TV centre (Rampura) - site label UNCONFIRMED per schema AMBIGUOUS_STATIONS
+DoE,23.778,90.378,Dhaka,1,Department of Environment HQ (Agargaon) - cold-start station

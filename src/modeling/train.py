@@ -41,7 +41,9 @@ def build_model(name: str, n_stations: int, cfg: dict, gamma_kwargs: dict | None
         kw = dict(d_model=cfg["d_model"], n_heads=cfg["n_heads"], seq_len=cfg["seq_len"],
                   n_horizons=H, n_quantiles=Q,
                   spatial_layers=cfg.get("spatial_layers", 2),
-                  use_staleness_gate=cfg.get("use_staleness_gate", True))
+                  use_staleness_gate=cfg.get("use_staleness_gate", True),
+                  use_geo=cfg.get("use_geo", True), use_wind=cfg.get("use_wind", True),
+                  use_learned_adj=cfg.get("use_learned_adj", False))
         kw.update(gamma_kwargs or {})          # adj_prior + ablation switches override
         return GAMMA(C, n_stations, **kw)
     cls = BASELINES[name]

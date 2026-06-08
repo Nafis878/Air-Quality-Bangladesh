@@ -34,9 +34,18 @@ use_anchor: true
 # GAMMA spatial graph (the uniquely-cross-station capability)
 spatial_layers: 2          # multi-hop station message passing
 use_staleness_gate: true   # fusion gate sees self-staleness -> routes to neighbours when own data is stale
+# Physics-informed, inductive spatial graph (external coords in data/external/station_coords.csv).
+coords_path: "data/external/station_coords.csv"
+use_geo: true              # geographic distance-decay edges
+use_wind: true             # dynamic wind-transport edges (upwind source -> downwind target)
+use_learned_adj: false     # if true, fall back to the v3 free correlation graph (no physics)
 # Pre-registered staleness strata (hours since the station last reported PM2.5): fresh <=1 /
 # moderate 2-6 / stale 7..seq_len-1 / self_blackout >=seq_len (no PM2.5 in the input window).
 staleness_bins: [1, 6]
+# C2 cold-start (station absent from train) and C3 outage-counterfactual + C4 calibration.
+cold_start_station: "DoE"
+calibration_nominal: 0.8
+outage_lengths: [6, 12, 24]
 # GAMMA (proposed model) trains on a denser anchor stride than the baselines because its
 # cross-section formulation yields ~5x fewer anchors; keeps gradient-step budget comparable.
 gamma_stride: 1
@@ -51,6 +60,7 @@ quick:
   seeds: [0]
   gamma_stride: 24
   gamma_max_epochs: 2
+  outage_lengths: [12]
 
 paths:
   checkpoints: "results/checkpoints"

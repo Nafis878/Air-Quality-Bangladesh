@@ -22,6 +22,9 @@ ABLATIONS = {
     "GAMMA_no_staleness_gate": {"use_staleness_gate": False},  # gate blind to self-staleness
     "GAMMA_one_hop":           {"spatial_layers": 1},          # single-hop spatial message passing
     "GAMMA_no_anchor":         {"_use_anchor": False},         # drop the shared persistence residual
+    "GAMMA_no_geo":            {"use_geo": False},             # drop geographic distance edges
+    "GAMMA_no_wind":           {"use_wind": False},            # drop dynamic wind-transport edges
+    "GAMMA_learned_adj":       {"use_learned_adj": True},      # v3 free correlation graph (no physics)
 }
 
 
