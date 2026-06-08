@@ -111,33 +111,137 @@ def make_latex_table(payload, out_path, agg="macro"):
         fh.write("\n".join(lines))
 
 
-def verdict(payload, agg="macro") -> str:
+def _stale_mae_lookup(strata):
+    """{(model, horizon, bin): (mae, n)} from the stratified payload."""
+    out = {}
+    for r in strata.get("mae", []):
+        out[(r["model"], int(r["horizon"]), r["bin"])] = (r["mae"], r["n"])
+    return out
+
+
+def make_staleness_figure(payload, out_path):
+    """MAE vs input-staleness bin for the models that tell the capability story, at the longest
+    horizon (where neighbours matter most). GAMMA should hold up into the stale/self_blackout bins
+    while persistence and the per-station baseline blow up."""
+    strata = payload.get("stratified", {})
+    bins = strata.get("bins", [])
+    if not bins:
+        return
+    h = max(payload["config"]["horizons"])
+    lut = _stale_mae_lookup(strata)
+    focus = ["GAMMA", "persistence", "GAMMA_no_spatial"]
+    bb = strata.get("best_baseline", {}).get(str(h)) or strata.get("best_baseline", {}).get(h)
+    if bb:
+        focus.append(bb)
+    styles = {"GAMMA": ("#b30000", "-", "o"), "persistence": ("#777777", "--", "s"),
+              "GAMMA_no_spatial": ("#d28b00", ":", "^")}
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(bins))
+    for m in dict.fromkeys(focus):
+        ys = [lut.get((m, h, b), (float("nan"), 0))[0] for b in bins]
+        if all(y != y for y in ys):
+            continue
+        c, ls, mk = styles.get(m, ("#4c72b0", "-.", "D"))
+        ax.plot(x, ys, ls, marker=mk, color=c, label=m, linewidth=2, markersize=7)
+    ax.set_xticks(x); ax.set_xticklabels(bins, rotation=20, ha="right")
+    ax.set_xlabel("Input staleness of the target station's PM2.5 (hours since last report)")
+    ax.set_ylabel(f"Test PM2.5 MAE at t+{h}  — lower is better")
+    ax.set_title("Cross-station capability: error vs sensor staleness\n"
+                 "(only GAMMA can read neighbours; persistence/per-station baselines are pinned to a stale value)")
+    ax.set_ylim(bottom=0); ax.grid(True, linestyle="--", alpha=0.5); ax.legend()
+    fig.tight_layout(); fig.savefig(out_path, dpi=140); plt.close(fig)
+
+
+def capability_verdict(payload) -> str:
+    """Honest read of the uniquely-GAMMA capability from the staleness-stratified DM tests."""
+    strata = payload.get("stratified", {})
+    dm = strata.get("dm", {})
+    if not dm:
+        return "_(no staleness-stratified analysis available)_"
+    lut = _stale_mae_lookup(strata)
     horizons = payload["config"]["horizons"]
-    lines, wins, sig_wins = [], 0, 0
+    lines, wins, tested = [], 0, 0
+    for blabel, by_h in dm.items():
+        for h in horizons:
+            comps = by_h.get(str(h)) or by_h.get(h)
+            if not comps:
+                continue
+            vp = comps.get("vs_persistence", {})
+            vb = comps.get("vs_best_baseline", {})
+            gmae = lut.get(("GAMMA", h, blabel), (float("nan"), 0))
+            parts = []
+            for tag, v in (("persistence", vp), (f"baseline {vb.get('competitor')}", vb)):
+                n, p, dmv = v.get("n", 0), v.get("p", float("nan")), v.get("dm", float("nan"))
+                if n and n >= 8 and p == p:
+                    tested += 1
+                    better = (dmv < 0 and p < 0.05)
+                    wins += better
+                    parts.append(f"vs {tag}: {'GAMMA better' if better else ('worse' if dmv>0 and p<0.05 else 'n.s.')}"
+                                 f" (DM={dmv:.2f}, p={p:.3f}, n={n})")
+                elif n and n >= 8:
+                    parts.append(f"vs {tag}: DM undefined — near-identical errors (n={n})")
+                else:
+                    parts.append(f"vs {tag}: insufficient n ({n})")
+            lines.append(f"- **{blabel}** t+{h} (GAMMA MAE={gmae[0]:.2f}, n={gmae[1]}): " + "; ".join(parts))
+    if tested == 0:
+        head = ("**Capability: inconclusive** — too few stale/self-blackout target points to test "
+                "the cross-station advantage at significance. Report the bin counts honestly.")
+    elif wins >= max(1, tested) * 0.6:
+        head = ("**Capability CONFIRMED** — in the stale / self-blackout regime GAMMA DM-significantly "
+                "beats persistence and per-station baselines, which are structurally pinned to a stale "
+                "value. Cross-check that `GAMMA_no_spatial` loses this edge (mechanism = neighbours).")
+    elif wins > 0:
+        head = ("**Capability PARTIAL** — GAMMA wins in some stale bins/horizons but not consistently; "
+                "report exactly where it does and does not, no overclaim.")
+    else:
+        head = ("**Capability NOT demonstrated** — GAMMA does not separate from the floors/baselines "
+                "even under staleness on this panel. Say so plainly.")
+    return head + "\n\n" + "\n".join(lines)
+
+
+def verdict(payload, agg="macro") -> str:
+    """Honest, floor-aware verdict derived from the numbers — covers GAMMA winning, GAMMA
+    being worst, and the case where NO learned model beats the naive floors."""
+    horizons = payload["config"]["horizons"]
+    floors = [m for m in NAIVE_METHODS if m in payload["summary"]]
+    baselines = [m for m in LEARNED if m != "GAMMA" and m in payload["summary"]]
+    lines = []
+    best_each, beats_floor_each, dm_better, dm_worse = 0, 0, 0, 0
     for h in horizons:
         gm = _val(payload["summary"]["GAMMA"], h, agg, "mae", "mean")
-        comp = {m: _val(payload["summary"][m], h, agg, "mae", "mean")
-                for m in LEARNED if m != "GAMMA" and m in payload["summary"]}
-        best_base = min(comp, key=comp.get)
-        is_best = gm <= comp[best_base]
-        wins += is_best
+        comp = {m: _val(payload["summary"][m], h, agg, "mae", "mean") for m in baselines}
+        flr = {m: _val(payload["summary"][m], h, agg, "mae", "mean") for m in floors}
+        best_base = min(comp, key=comp.get); best_flr = min(flr, key=flr.get) if flr else None
+        is_best_learned = gm <= comp[best_base]
+        beats_floor = (best_flr is not None) and (gm <= flr[best_flr])
+        best_each += is_best_learned
+        beats_floor_each += beats_floor
         holm = payload.get("dm", {}).get(str(h), {}).get("holm", {})
-        n_sig = sum(1 for m in comp if holm.get(m, {}).get("reject"))
-        sig_wins += (is_best and n_sig == len(comp))
-        lines.append(f"- t+{h}: GAMMA MAE={gm:.2f} vs best baseline {best_base}={comp[best_base]:.2f} "
-                     f"({'GAMMA better' if is_best else 'baseline better'}); "
-                     f"DM-significant over {n_sig}/{len(comp)} baselines (Holm).")
-    if sig_wins == len(horizons):
-        head = "**Verdict: GAMMA is significantly best** — lowest MAE at every horizon with DM significance over all baselines."
-    elif wins == len(horizons):
-        head = ("**Verdict: GAMMA is best on point accuracy but the lead is within noise** "
-                "(not DM-significant across all baselines). Lead with the efficiency result.")
+        dmv = payload.get("dm", {}).get(str(h), {}).get("dm", {})
+        nb = sum(1 for m in comp if holm.get(m, {}).get("reject") and dmv.get(m, 0) < 0)  # GAMMA better
+        nw = sum(1 for m in comp if holm.get(m, {}).get("reject") and dmv.get(m, 0) > 0)  # GAMMA worse
+        dm_better += (nb == len(comp)); dm_worse += (nw > len(comp) // 2)
+        flr_txt = f"best floor {best_flr}={flr[best_flr]:.2f}" if best_flr else "no floors"
+        lines.append(f"- t+{h}: GAMMA={gm:.2f} | best baseline {best_base}={comp[best_base]:.2f} | "
+                     f"{flr_txt} | GAMMA DM-better than {nb}/{len(comp)}, worse than {nw}/{len(comp)} "
+                     f"baselines (Holm).")
+    H = len(horizons)
+    if dm_worse == H:
+        head = ("**Verdict: GAMMA underperforms — it is significantly WORSE than most baselines at "
+                "every horizon and is not viable on this panel.** Report this plainly.")
+    elif best_each == H and beats_floor_each == H and dm_better == H:
+        head = ("**Verdict: GAMMA is significantly best** — lowest MAE at every horizon, DM-significant "
+                "over all baselines, AND it beats the naive floors. A real positive result.")
+    elif best_each == H and beats_floor_each < H:
+        head = ("**Verdict: GAMMA is the best LEARNED model but does NOT beat the naive floors at "
+                "every horizon.** The honest headline is the benchmark caveat: deep models (incl. "
+                "GAMMA) do not convincingly beat persistence/seasonal-naive here.")
+    elif beats_floor_each < H:
+        head = ("**Verdict: no learned model (incl. GAMMA) beats the naive floors at every horizon.** "
+                "Lead with the benchmark finding, not a SOTA claim.")
     else:
-        gp = payload["params"]["GAMMA"]
-        smaller = [m for m in LEARNED if m != "GAMMA" and payload["params"].get(m, 0) > gp]
-        head = ("**Verdict: GAMMA is statistically competitive, not uniformly best.** "
-                f"It is not the lowest-MAE model at every horizon; its case rests on efficiency "
-                f"(fewer parameters than {len(smaller)} of the deep baselines).")
+        head = ("**Verdict: GAMMA is competitive but mixed** — not uniformly best across horizons; "
+                "state per-horizon results without overclaiming.")
     return head + "\n\n" + "\n".join(lines)
 
 
@@ -182,6 +286,31 @@ def write_report(payload, out_path, fig_rel="figures"):
                   f"{', '.join(sig) if sig else '(none)'}.")
     md.append("\n## Verdict\n")
     md.append(verdict(payload))
+    # ---- the uniquely-GAMMA capability: stratified by sensor staleness ----
+    strata = payload.get("stratified", {})
+    if strata.get("bins"):
+        h = max(cfg["horizons"])
+        lut = _stale_mae_lookup(strata)
+        bins = strata["bins"]
+        bb = strata.get("best_baseline", {}).get(str(h)) or strata.get("best_baseline", {}).get(h)
+        focus = list(dict.fromkeys(["GAMMA", "persistence"] + ([bb] if bb else []) + ["GAMMA_no_spatial"]))
+        md.append(f"\n## Cross-station capability — PM2.5 MAE at t+{h} by input staleness\n")
+        md.append("> Only GAMMA can read other stations' concurrent readings; persistence and every "
+                  "per-station baseline are pinned to the target station's own (stale) last value. "
+                  "Bins are pre-registered. `n` is the number of observed targets in the bin.\n")
+        md.append("| Staleness bin | " + " | ".join(focus) + " | n |")
+        md.append("|" + "---|" * (len(focus) + 2))
+        for b in bins:
+            cells = []
+            n_b = 0
+            for m in focus:
+                mae, n = lut.get((m, h, b), (float("nan"), 0))
+                n_b = max(n_b, n if m == "GAMMA" else n_b)
+                cells.append(f"{mae:.2f}" if mae == mae else "—")
+            gmae, gn = lut.get(("GAMMA", h, b), (float("nan"), 0))
+            md.append(f"| {b} | " + " | ".join(cells) + f" | {gn} |")
+        md.append("\n_See `figures/staleness_capability.png`._\n")
+        md.append(capability_verdict(payload))
     md.append("\n## Limitations\n")
     md.append("- Station coverage is uneven; the 12-station scope excludes sparse/cold-start sites "
               "(CDA/DoE enter late; Agrabad/Sangsad exit 2021; Cumilla/Mymensingh/Savar too sparse).")
@@ -198,6 +327,7 @@ def generate_all(results_dir="results"):
     os.makedirs(figs, exist_ok=True); os.makedirs(tabs, exist_ok=True)
     make_primary_figure(payload, os.path.join(figs, "primary_test_mae.png"))
     make_efficiency_figure(payload, os.path.join(figs, "efficiency.png"))
+    make_staleness_figure(payload, os.path.join(figs, "staleness_capability.png"))
     make_latex_table(payload, os.path.join(tabs, "results_table.tex"))
     write_report(payload, os.path.join(results_dir, "methods_results.md"))
     print(f"artifacts written under {results_dir}/")

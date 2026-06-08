@@ -27,6 +27,20 @@ batch_size: 128
 lr: 0.001
 max_epochs: 30
 patience: 5             # early stop on val masked-quantile loss
+
+# Fair fight: every model predicts a correction on top of the persistence anchor (= the persistence
+# floor), applied uniformly outside the network, so a GAMMA win reflects architecture not a prior.
+use_anchor: true
+# GAMMA spatial graph (the uniquely-cross-station capability)
+spatial_layers: 2          # multi-hop station message passing
+use_staleness_gate: true   # fusion gate sees self-staleness -> routes to neighbours when own data is stale
+# Pre-registered staleness strata (hours since the station last reported PM2.5): fresh <=1 /
+# moderate 2-6 / stale 7..seq_len-1 / self_blackout >=seq_len (no PM2.5 in the input window).
+staleness_bins: [1, 6]
+# GAMMA (proposed model) trains on a denser anchor stride than the baselines because its
+# cross-section formulation yields ~5x fewer anchors; keeps gradient-step budget comparable.
+gamma_stride: 1
+gamma_max_epochs: 30
 grad_clip: 1.0
 seeds: [0, 1, 2, 3, 4]  # >=5 seeds
 
@@ -35,6 +49,8 @@ quick:
   stride: {train: 48, val: 24, test: 24}
   max_epochs: 2
   seeds: [0]
+  gamma_stride: 24
+  gamma_max_epochs: 2
 
 paths:
   checkpoints: "results/checkpoints"

@@ -38,8 +38,12 @@ def build_model(name: str, n_stations: int, cfg: dict, gamma_kwargs: dict | None
     C = len(CHANNELS)
     H, Q = len(cfg["horizons"]), len(cfg["quantiles"])
     if is_gamma(name):
-        return GAMMA(C, n_stations, d_model=cfg["d_model"], n_heads=cfg["n_heads"],
-                     seq_len=cfg["seq_len"], n_horizons=H, n_quantiles=Q, **(gamma_kwargs or {}))
+        kw = dict(d_model=cfg["d_model"], n_heads=cfg["n_heads"], seq_len=cfg["seq_len"],
+                  n_horizons=H, n_quantiles=Q,
+                  spatial_layers=cfg.get("spatial_layers", 2),
+                  use_staleness_gate=cfg.get("use_staleness_gate", True))
+        kw.update(gamma_kwargs or {})          # adj_prior + ablation switches override
+        return GAMMA(C, n_stations, **kw)
     cls = BASELINES[name]
     return cls(C, seq_len=cfg["seq_len"], hidden=cfg["d_model"], n_horizons=H, n_quantiles=Q)
 

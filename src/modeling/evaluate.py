@@ -101,6 +101,96 @@ def pm25_frame(pred_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return sub.sort_values(["station", "t"]).reset_index(drop=True)
 
 
+def staleness_bin_labels(seq_len: int, edges=(1, 6)) -> list[tuple[str, float, float]]:
+    """Pre-registered bins by input-side PM2.5 staleness (hours since the station last reported).
+
+    Returns ordered (label, lo, hi) with lo < staleness <= hi (the first bin includes 0). The final
+    `self_blackout` bin is staleness >= seq_len: the station has NO observed PM2.5 in its whole input
+    window, so per-station baselines and persistence are structurally blind and only GAMMA (neighbours)
+    can forecast it.
+    """
+    e1, e2 = edges
+    return [
+        (f"fresh(<={e1}h)", -1.0, float(e1)),
+        (f"moderate({e1+1}-{e2}h)", float(e1), float(e2)),
+        (f"stale({e2+1}-{seq_len-1}h)", float(e2), float(seq_len - 1)),
+        (f"self_blackout(>={seq_len}h)", float(seq_len - 1), float("inf")),
+    ]
+
+
+def _assign_bin(staleness: np.ndarray, bins) -> np.ndarray:
+    out = np.empty(len(staleness), dtype=object)
+    for label, lo, hi in bins:
+        out[(staleness > lo) & (staleness <= hi)] = label
+    return out
+
+
+def staleness_strata(pm25_by_model: dict, horizons, seq_len: int, baseline_names,
+                     edges=(1, 6), gamma_key="GAMMA", floor_key="persistence") -> dict:
+    """Stratify PM2.5 test errors by input staleness; the cross-station capability lives here.
+
+    Returns {"bins": [...], "mae": [rows], "dm": {bin: {h: {competitor: (dm,p,n)}}}}. DM (GAMMA vs
+    persistence and vs the best baseline) is computed only in the stale + self_blackout bins, where
+    the unique-to-GAMMA neighbour routing should pay off.
+    """
+    bins = staleness_bin_labels(seq_len, edges)
+    bin_order = [b[0] for b in bins]
+    # tag every model's rows with a bin label
+    tagged = {}
+    for name, df in pm25_by_model.items():
+        if df is None or len(df) == 0 or "staleness" not in df:
+            continue
+        d = df.copy()
+        d["bin"] = _assign_bin(d["staleness"].to_numpy(), bins)
+        tagged[name] = d
+
+    mae_rows = []
+    for name, d in tagged.items():
+        err = (d["y_true"] - d["y_pred"]).abs()
+        g = d.assign(abs_err=err).groupby(["horizon", "bin"], as_index=False).agg(
+            mae=("abs_err", "mean"), n=("abs_err", "size"))
+        for _, r in g.iterrows():
+            mae_rows.append({"model": name, "horizon": int(r["horizon"]),
+                             "bin": r["bin"], "mae": float(r["mae"]), "n": int(r["n"])})
+
+    # best baseline per horizon by OVERALL pm25 MAE (across all bins)
+    best_baseline = {}
+    for h in horizons:
+        cands = [(name, ((d[d.horizon == h]["y_true"] - d[d.horizon == h]["y_pred"]).abs().mean()))
+                 for name, d in tagged.items() if name in baseline_names and (d.horizon == h).any()]
+        cands = [(n, m) for n, m in cands if m == m]
+        best_baseline[h] = min(cands, key=lambda x: x[1])[0] if cands else None
+
+    dm = {}
+    if gamma_key in tagged:
+        g_all = tagged[gamma_key]
+        focus_bins = [b for b in bin_order if b.startswith(("stale", "self_blackout"))]
+        for blabel in focus_bins:
+            dm[blabel] = {}
+            for h in horizons:
+                comps = {}
+                gb = g_all[(g_all.horizon == h) & (g_all.bin == blabel)]
+                for ckey, cname in (("vs_persistence", floor_key),
+                                    ("vs_best_baseline", best_baseline.get(h))):
+                    if cname is None or cname not in tagged:
+                        comps[ckey] = {"competitor": cname, "dm": float("nan"),
+                                       "p": float("nan"), "n": 0}
+                        continue
+                    cb = tagged[cname]
+                    cb = cb[(cb.horizon == h) & (cb.bin == blabel)]
+                    merged = gb.merge(cb, on=["t", "station", "horizon"], suffixes=("_g", "_c"))
+                    if len(merged) < 8:
+                        comps[ckey] = {"competitor": cname, "dm": float("nan"),
+                                       "p": float("nan"), "n": len(merged)}
+                        continue
+                    e_g = merged["y_true_g"].to_numpy() - merged["y_pred_g"].to_numpy()
+                    e_c = merged["y_true_c"].to_numpy() - merged["y_pred_c"].to_numpy()
+                    dmv, p, n = diebold_mariano(e_g, e_c, h=h)
+                    comps[ckey] = {"competitor": cname, "dm": dmv, "p": p, "n": n}
+                dm[blabel][h] = comps
+    return {"bins": bin_order, "best_baseline": best_baseline, "mae": mae_rows, "dm": dm}
+
+
 def diebold_mariano(e1: np.ndarray, e2: np.ndarray, h: int = 1, power: int = 2):
     """Two-sided DM test with Newey-West HAC (lag h-1) + Harvey small-sample correction.
 

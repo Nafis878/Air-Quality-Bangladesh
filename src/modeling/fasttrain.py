@@ -19,7 +19,10 @@ from .channels import CHANNELS
 from .losses import MaskedQuantileLoss, median_index
 from .metrics import aggregate
 from .windows import valid_anchors
+from .models.naive import _ffill_time
 from .train import build_model, count_params, is_gamma, set_seed
+
+PM25 = CHANNELS.index("pm25")
 
 
 class _DeviceArrays:
@@ -32,6 +35,9 @@ class _DeviceArrays:
         self.D = torch.from_numpy(arr.d).to(device)
         self.V = torch.from_numpy(np.nan_to_num(arr.val_scaled, nan=0.0)).to(device)
         self.Vmask = torch.from_numpy((~np.isnan(arr.val_scaled)).astype(np.float32)).to(device)
+        # persistence anchor: last OBSERVED value forward-filled (== the persistence floor),
+        # scaled space; used as the shared residual base for every model. Leakage-safe (<= t).
+        self.A = torch.from_numpy(np.nan_to_num(_ffill_time(arr.val_scaled), nan=0.0)).to(device)
         self.present = torch.from_numpy(arr.present.astype(np.float32)).to(device)  # [T,S]
         self.T, self.S, self.C = arr.x.shape
         self.offsets = torch.arange(-seq_len + 1, 1, device=device)               # [seq]
@@ -48,8 +54,9 @@ class _DeviceArrays:
         win = t[:, None] + self.offsets                                           # [B,seq]
         x = self.X[win, s[:, None]]                                               # [B,seq,C]
         d = self.D[win, s[:, None]]
+        anchor = self.A[t, s]                                                     # [B,C] persistence
         ys = {h: (self.V[t + h, s], self.Vmask[t + h, s]) for h in self.horizons}  # [B,C]
-        return x, d, t, s, ys
+        return x, d, t, s, anchor, ys
 
     def gamma_batch(self, idx):
         t = self.t_cs[idx]
@@ -58,22 +65,27 @@ class _DeviceArrays:
         m = self.M[win].permute(0, 2, 1, 3).contiguous()
         d = self.D[win].permute(0, 2, 1, 3).contiguous()
         present = self.present[t]                                                  # [B,S]
+        anchor = self.A[t]                                                        # [B,S,C] persistence
         ys = {h: (self.V[t + h], self.Vmask[t + h]) for h in self.horizons}        # [B,S,C]
-        return x, m, d, present, t, ys
+        return x, m, d, present, t, anchor, ys
 
 
-def _forward_loss(name, model, dev: _DeviceArrays, idx, crit, horizons):
+def _forward_loss(name, model, dev: _DeviceArrays, idx, crit, horizons, use_anchor=True):
     if is_gamma(name):
-        x, m, d, present, t, ys = dev.gamma_batch(idx)
+        x, m, d, present, t, anchor, ys = dev.gamma_batch(idx)
         st = torch.arange(dev.S, device=dev.device).unsqueeze(0).expand(len(t), -1)
         preds = model(x, m, d, present, st)                       # [B,S,H,C,Q]
+        if use_anchor:
+            preds = preds + anchor[:, :, None, :, None]           # residual on persistence
         loss = 0.0
         for hi, h in enumerate(horizons):
             y, ym = ys[h]
             loss = loss + crit(preds[:, :, hi], y, ym)
         return loss
-    x, d, t, s, ys = dev.baseline_batch(idx)
+    x, d, t, s, anchor, ys = dev.baseline_batch(idx)
     preds = model(x)                                              # [B,H,C,Q]
+    if use_anchor:
+        preds = preds + anchor[:, None, :, None]                  # residual on persistence
     loss = 0.0
     for hi, h in enumerate(horizons):
         y, ym = ys[h]
@@ -86,38 +98,45 @@ def _n_anchors(name, dev):
 
 
 @torch.no_grad()
-def _eval_loss(name, model, dev, crit, horizons, bs):
+def _eval_loss(name, model, dev, crit, horizons, bs, use_anchor=True):
     model.eval()
     n = _n_anchors(name, dev)
     tot, nb = 0.0, 0
     for i in range(0, n, bs):
         idx = torch.arange(i, min(i + bs, n), device=dev.device)
-        tot += float(_forward_loss(name, model, dev, idx, crit, horizons)); nb += 1
+        tot += float(_forward_loss(name, model, dev, idx, crit, horizons, use_anchor)); nb += 1
     return tot / max(nb, 1)
 
 
-def train_model(name, prep, cfg, seed, gamma_kwargs=None, device="cpu", verbose=False):
+def train_model(name, prep, cfg, seed, gamma_kwargs=None, device="cpu", verbose=False,
+                use_anchor=True):
     set_seed(seed)
     horizons, bs = cfg["horizons"], cfg["batch_size"]
-    dev = {s: _DeviceArrays(prep.arrays[s], cfg["seq_len"], horizons, cfg["stride"][s], device)
-           for s in ("train", "val")}
+    # GAMMA may train on a denser anchor stride / more epochs (it is data-starved at stride 3).
+    train_stride = cfg["stride"]["train"]
+    max_epochs = cfg["max_epochs"]
+    if is_gamma(name):
+        train_stride = cfg.get("gamma_stride", train_stride)
+        max_epochs = cfg.get("gamma_max_epochs", max_epochs)
+    dev = {"train": _DeviceArrays(prep.arrays["train"], cfg["seq_len"], horizons, train_stride, device),
+           "val": _DeviceArrays(prep.arrays["val"], cfg["seq_len"], horizons, cfg["stride"]["val"], device)}
     model = build_model(name, len(prep.stations), cfg, gamma_kwargs).to(device)
     crit = MaskedQuantileLoss(cfg["quantiles"]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     n_train = _n_anchors(name, dev["train"])
 
     best_val, best_state, best_epoch, bad, history = float("inf"), None, -1, 0, []
-    for epoch in range(cfg["max_epochs"]):
+    for epoch in range(max_epochs):
         model.train()
         perm = torch.randperm(n_train, device=device)
         for i in range(0, n_train, bs):
             idx = perm[i:i + bs]
             opt.zero_grad()
-            loss = _forward_loss(name, model, dev["train"], idx, crit, horizons)
+            loss = _forward_loss(name, model, dev["train"], idx, crit, horizons, use_anchor)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("grad_clip", 1.0))
             opt.step()
-        vl = _eval_loss(name, model, dev["val"], crit, horizons, bs)
+        vl = _eval_loss(name, model, dev["val"], crit, horizons, bs, use_anchor)
         history.append(vl)
         if verbose:
             print(f"    [{name} seed{seed}] epoch {epoch+1} val={vl:.6f}")
@@ -134,22 +153,32 @@ def train_model(name, prep, cfg, seed, gamma_kwargs=None, device="cpu", verbose=
 
 
 @torch.no_grad()
-def collect_predictions(name, model, prep, cfg, device="cpu"):
-    """Long df [t, station, horizon, channel, y_true, y_pred] on TEST (physical, observed only)."""
+def collect_predictions(name, model, prep, cfg, device="cpu", use_anchor=True):
+    """Long df [t, station, horizon, channel, y_true, y_pred, staleness] on TEST.
+
+    Physical units, observed targets only. `staleness` = hours since the station last observed
+    PM2.5 at the anchor (== GRU-D decay at t); it is the input-side, leakage-safe stratifier for
+    the cross-station capability analysis (fresh vs stale vs self-blackout).
+    """
     model.eval()
     horizons, bs = cfg["horizons"], cfg["batch_size"]
     qmid = median_index(cfg["quantiles"])
     dev = _DeviceArrays(prep.arrays["test"], cfg["seq_len"], horizons, cfg["stride"]["test"], device)
     mu = torch.tensor([prep.scaler.global_[c][0] for c in CHANNELS], device=device)
     sd = torch.tensor([prep.scaler.global_[c][1] for c in CHANNELS], device=device)
+    stale_ts = dev.D[:, :, PM25]                                       # [T,S] hours-since-PM2.5-obs
     rows = []
     n = _n_anchors(name, dev)
     for i in range(0, n, bs):
         idx = torch.arange(i, min(i + bs, n), device=device)
         if is_gamma(name):
-            x, m, d, present, t, ys = dev.gamma_batch(idx)
+            x, m, d, present, t, anchor, ys = dev.gamma_batch(idx)
             st = torch.arange(dev.S, device=device).unsqueeze(0).expand(len(t), -1)
-            preds = model(x, m, d, present, st)[..., qmid]            # [B,S,H,C]
+            preds = model(x, m, d, present, st)                       # [B,S,H,C,Q]
+            if use_anchor:
+                preds = preds + anchor[:, :, None, :, None]
+            preds = preds[..., qmid]                                  # [B,S,H,C]
+            stale = stale_ts[t]                                       # [B,S]
             for hi, h in enumerate(horizons):
                 y, ym = ys[h]
                 yp = preds[:, :, hi] * sd + mu
@@ -158,10 +187,15 @@ def collect_predictions(name, model, prep, cfg, device="cpu"):
                 rows.append(pd.DataFrame({
                     "t": t[bi].cpu().numpy(), "station": si.cpu().numpy(), "horizon": h,
                     "channel": ci.cpu().numpy(),
-                    "y_true": yt[bi, si, ci].cpu().numpy(), "y_pred": yp[bi, si, ci].cpu().numpy()}))
+                    "y_true": yt[bi, si, ci].cpu().numpy(), "y_pred": yp[bi, si, ci].cpu().numpy(),
+                    "staleness": stale[bi, si].cpu().numpy()}))
         else:
-            x, d, t, s, ys = dev.baseline_batch(idx)
-            preds = model(x)[..., qmid]                                # [B,H,C]
+            x, d, t, s, anchor, ys = dev.baseline_batch(idx)
+            preds = model(x)                                          # [B,H,C,Q]
+            if use_anchor:
+                preds = preds + anchor[:, None, :, None]
+            preds = preds[..., qmid]                                  # [B,H,C]
+            stale = stale_ts[t, s]                                    # [B]
             for hi, h in enumerate(horizons):
                 y, ym = ys[h]
                 yp = preds[:, hi] * sd + mu
@@ -170,6 +204,7 @@ def collect_predictions(name, model, prep, cfg, device="cpu"):
                 rows.append(pd.DataFrame({
                     "t": t[bi].cpu().numpy(), "station": s[bi].cpu().numpy(), "horizon": h,
                     "channel": ci.cpu().numpy(),
-                    "y_true": yt[bi, ci].cpu().numpy(), "y_pred": yp[bi, ci].cpu().numpy()}))
+                    "y_true": yt[bi, ci].cpu().numpy(), "y_pred": yp[bi, ci].cpu().numpy(),
+                    "staleness": stale[bi].cpu().numpy()}))
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(
-        columns=["t", "station", "horizon", "channel", "y_true", "y_pred"])
+        columns=["t", "station", "horizon", "channel", "y_true", "y_pred", "staleness"])

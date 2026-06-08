@@ -12,9 +12,10 @@ from src.modeling.channels import CHANNELS
 from src.modeling.windows import PanelArrays, StationWindowDataset
 from src.modeling.losses import MaskedQuantileLoss, median_index
 from src.modeling.models.gamma import GAMMA
-from src.modeling.models.naive import NaiveForecasters
+from src.modeling.models.naive import NaiveForecasters, _ffill_time
 from src.modeling.metrics import descale
-from src.modeling.evaluate import diebold_mariano, holm_bonferroni
+from src.modeling.evaluate import diebold_mariano, holm_bonferroni, staleness_bin_labels
+from src.modeling.fasttrain import _DeviceArrays
 from src.splits import StandardScalerFrame
 
 
@@ -72,8 +73,9 @@ def test_pinball_at_median_equals_half_mae():
     assert abs(loss - 0.5 * target.abs().mean().item()) < 1e-6
 
 
-def test_gamma_spatial_bias_is_live():
-    """The old SpatialAttention never used spatial_bias. The new one must: it gets gradient."""
+def test_gamma_adjacency_is_live():
+    """The spatial graph's learnable station->station adjacency must get gradient (it routes the
+    cross-station capability into the attention logits)."""
     torch.manual_seed(0)
     B, S, L, C = 2, 4, 8, len(CHANNELS)
     model = GAMMA(C, S, d_model=32, n_heads=4, seq_len=L, n_horizons=1, n_quantiles=1)
@@ -81,8 +83,77 @@ def test_gamma_spatial_bias_is_live():
     present = torch.ones(B, S); st = torch.arange(S).unsqueeze(0).repeat(B, 1)
     out = model(x, mask, decay, present, st)
     out.sum().backward()
-    assert model.spatial_bias.grad is not None
-    assert model.spatial_bias.grad.abs().sum().item() > 0.0
+    adj = model.spatial_graph.adjacency
+    assert adj.grad is not None and adj.grad.abs().sum().item() > 0.0
+
+
+def test_gamma_adjacency_uses_prior_and_is_multihop():
+    """adj_prior seeds the [n_heads,S,S] adjacency; spatial_layers controls the number of hops."""
+    torch.manual_seed(0)
+    S, C = 4, len(CHANNELS)
+    prior = np.random.randn(S, S).astype(np.float32)
+    m = GAMMA(C, S, d_model=32, n_heads=4, seq_len=8, n_horizons=1, n_quantiles=1,
+              spatial_layers=2, adj_prior=prior)
+    # every head initialised to the prior; two stacked spatial blocks (multi-hop)
+    for head in range(4):
+        assert np.allclose(m.spatial_graph.adjacency.detach().numpy()[head], prior, atol=1e-5)
+    assert len(m.spatial_graph.blocks) == 2
+    assert len(GAMMA(C, S, d_model=32, n_heads=4, seq_len=8, n_horizons=1, n_quantiles=1,
+                     spatial_layers=1).spatial_graph.blocks) == 1
+
+
+def test_gamma_decay_gate_is_bounded_identity_at_zero():
+    """Bounded multiplicative GRU-D gate: delta=0 => gamma=1 => no effect; large delta => effect.
+    Staleness gate is turned off here so decay only enters through the temporal decay gate."""
+    torch.manual_seed(0)
+    B, S, L, C = 2, 3, 8, len(CHANNELS)
+    kw = dict(d_model=32, n_heads=4, seq_len=L, n_horizons=1, n_quantiles=1, use_staleness_gate=False)
+    m = GAMMA(C, S, use_decay=True, **kw)
+    m2 = GAMMA(C, S, use_decay=False, **kw); m2.load_state_dict(m.state_dict())
+    x = torch.randn(B, S, L, C); mask = torch.ones(B, S, L, C); present = torch.ones(B, S)
+    st = torch.arange(S).unsqueeze(0).repeat(B, 1)
+    with torch.no_grad():
+        zero = m(x, mask, torch.zeros(B, S, L, C), present, st)
+        zero_off = m2(x, mask, torch.zeros(B, S, L, C), present, st)
+        big = m(x, mask, torch.full((B, S, L, C), 100.0), present, st)
+    assert torch.allclose(zero, zero_off, atol=1e-5)   # gamma=1 at delta=0 -> identical to no-decay
+    assert not torch.allclose(zero, big, atol=1e-4)    # large gaps change the output
+
+
+def test_gamma_staleness_gate_routes_on_staleness():
+    """With the temporal decay gate off, staleness reaches the model ONLY via the staleness-aware
+    fusion gate: output must respond to staleness when the gate sees it, and be invariant when it
+    does not. This is the knob that lets GAMMA trust neighbours when its own data is stale."""
+    torch.manual_seed(0)
+    B, S, L, C = 2, 4, 8, len(CHANNELS)
+    kw = dict(d_model=32, n_heads=4, seq_len=L, n_horizons=1, n_quantiles=1, use_decay=False)
+    on = GAMMA(C, S, use_staleness_gate=True, **kw)
+    off = GAMMA(C, S, use_staleness_gate=False, **kw); off.load_state_dict(on.state_dict())
+    x = torch.randn(B, S, L, C); mask = torch.ones(B, S, L, C); present = torch.ones(B, S)
+    st = torch.arange(S).unsqueeze(0).repeat(B, 1)
+    fresh = torch.zeros(B, S, L, C); stale = torch.full((B, S, L, C), 48.0)
+    with torch.no_grad():
+        assert not torch.allclose(on(x, mask, fresh, present, st), on(x, mask, stale, present, st))
+        assert torch.allclose(off(x, mask, fresh, present, st), off(x, mask, stale, present, st))
+
+
+def test_persistence_anchor_equals_ffill():
+    """The shared anchor that fasttrain adds to every model is exactly the persistence floor:
+    the last observed value forward-filled (scaled, NaN->0)."""
+    arr = _toy_panel(seed=5)
+    dev = _DeviceArrays(arr, seq_len=8, horizons=[1, 6], stride=1, device="cpu")
+    ff = np.nan_to_num(_ffill_time(arr.val_scaled), nan=0.0)
+    idx = torch.arange(min(16, len(dev.t_bl)))
+    _, _, t, s, anchor, _ = dev.baseline_batch(idx)
+    expected = ff[t.numpy(), s.numpy(), :]
+    assert np.allclose(anchor.numpy(), expected, atol=1e-5)
+
+
+def test_staleness_bins_are_ordered_and_cover_blackout():
+    bins = staleness_bin_labels(seq_len=24, edges=(1, 6))
+    assert [b[0].split("(")[0] for b in bins] == ["fresh", "moderate", "stale", "self_blackout"]
+    # self-blackout starts at seq_len (no observation anywhere in the input window)
+    assert bins[-1][1] == 23.0 and bins[-1][2] == float("inf")
 
 
 def test_gamma_spatial_ablation_changes_output():

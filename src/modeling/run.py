@@ -19,14 +19,14 @@ import torch
 from scipy import stats
 
 from .channels import CHANNELS, HORIZONS
-from .dataprep import prepare, load_config
+from .dataprep import prepare, load_config, inter_station_corr
 from .fasttrain import train_model, collect_predictions
 from .train import build_model, count_params, is_gamma
 from .evaluate import metrics_by_horizon, pm25_frame, diebold_mariano, holm_bonferroni
 from .models.baselines import BASELINES
 from .models.naive import NaiveForecasters, NAIVE_METHODS
 from .windows import valid_anchors, StationWindowDataset
-from .ablations import ABLATIONS
+from .ablations import ABLATIONS, split_ablation
 
 ROSTER = ["GAMMA", *BASELINES.keys()]
 
@@ -53,22 +53,28 @@ def summarize_seeds(per_seed_metrics: list[dict], horizons) -> list[dict]:
     return rows
 
 
-def train_and_eval_model(name, prep, cfg, seeds, device, gamma_kwargs=None, verbose=False):
-    """Train across seeds; return (summary_rows, seed_mean_pm25_df, n_params, val_losses)."""
+def train_and_eval_model(name, prep, cfg, seeds, device, gamma_kwargs=None, verbose=False,
+                         use_anchor=True):
+    """Train across seeds; return (summary_rows, seed_mean_pm25_df, n_params, val_losses).
+
+    The seed-mean PM2.5 frame carries `staleness` (identical across seeds) for the stratified
+    cross-station capability analysis.
+    """
     per_seed_metrics, pm25_per_seed, val_losses, n_params = [], [], [], None
     for seed in seeds:
         t0 = time.time()
-        res = train_model(name, prep, cfg, seed, gamma_kwargs=gamma_kwargs, device=device, verbose=verbose)
+        res = train_model(name, prep, cfg, seed, gamma_kwargs=gamma_kwargs, device=device,
+                          verbose=verbose, use_anchor=use_anchor)
         n_params = res["n_params"]; val_losses.append(res["val_loss"])
-        pred = collect_predictions(name, res["model"], prep, cfg, device)
+        pred = collect_predictions(name, res["model"], prep, cfg, device, use_anchor=use_anchor)
         per_seed_metrics.append(metrics_by_horizon(pred, cfg["horizons"]))
         pm25_per_seed.append(pred[pred["channel"] == CHANNELS.index("pm25")]
-                             [["t", "station", "horizon", "y_true", "y_pred"]])
+                             [["t", "station", "horizon", "y_true", "y_pred", "staleness"]])
         print(f"  [{name}] seed {seed}: val={res['val_loss']:.5f} "
               f"test_MAE_pm25_micro={_pm_mae(per_seed_metrics[-1]):.3f} ({time.time()-t0:.0f}s)")
-    # average PM2.5 predictions across seeds for DM
+    # average PM2.5 predictions across seeds for DM (staleness is seed-invariant)
     keyed = pd.concat(pm25_per_seed).groupby(["t", "station", "horizon"], as_index=False).agg(
-        y_true=("y_true", "first"), y_pred=("y_pred", "mean"))
+        y_true=("y_true", "first"), y_pred=("y_pred", "mean"), staleness=("staleness", "first"))
     return summarize_seeds(per_seed_metrics, cfg["horizons"]), keyed, n_params, val_losses
 
 
@@ -92,6 +98,8 @@ def naive_eval(prep, cfg):
     from .metrics import descale, aggregate
     mu = np.array([prep.scaler.global_[c][0] for c in CHANNELS])
     sd = np.array([prep.scaler.global_[c][1] for c in CHANNELS])
+    pm = CHANNELS.index("pm25")
+    stale_pm25 = test_arr.d[t_idx, s_idx, pm]                                     # hours since PM2.5 obs
     out = {}
     for method in NAIVE_METHODS:
         per_h, pm25_rows = {}, []
@@ -103,10 +111,10 @@ def naive_eval(prep, cfg):
             from .metrics import pointwise_frame
             frame = pointwise_frame(yp, np.nan_to_num(yt, nan=0.0), m, s_idx)
             per_h[h] = aggregate(frame)
-            pm = CHANNELS.index("pm25")
             keep = m[:, pm] > 0
             pm25_rows.append(pd.DataFrame({"t": t_idx[keep], "station": s_idx[keep], "horizon": h,
-                                           "y_true": yt[keep, pm], "y_pred": yp[keep, pm]}))
+                                           "y_true": yt[keep, pm], "y_pred": yp[keep, pm],
+                                           "staleness": stale_pm25[keep]}))
         out[method] = {"summary": summarize_seeds([per_h], cfg["horizons"]),
                        "pm25": pd.concat(pm25_rows, ignore_index=True)}
     return out
@@ -141,6 +149,8 @@ def main():
     ap.add_argument("--out", default="results")
     ap.add_argument("--device", default="auto", help="auto|cpu|cuda")
     ap.add_argument("--stride-train", type=int, default=None, help="override train anchor stride")
+    ap.add_argument("--gamma-stride", type=int, default=None,
+                    help="override GAMMA's train anchor stride (throttle its density on CPU)")
     ap.add_argument("--seeds", default=None, help="override seeds, comma list e.g. 0,1,2,3,4")
     ap.add_argument("--max-epochs", type=int, default=None, help="override max epochs")
     ap.add_argument("--batch-size", type=int, default=None, help="override batch size")
@@ -150,8 +160,11 @@ def main():
     cfg = load_config(args.config)
     if args.quick:
         q = cfg["quick"]; cfg["stride"] = q["stride"]; cfg["max_epochs"] = q["max_epochs"]; cfg["seeds"] = q["seeds"]
+        cfg["gamma_stride"] = q.get("gamma_stride", cfg.get("gamma_stride")); cfg["gamma_max_epochs"] = q.get("gamma_max_epochs", cfg.get("gamma_max_epochs"))
     if args.stride_train is not None:
         cfg["stride"] = {**cfg["stride"], "train": args.stride_train}
+    if args.gamma_stride is not None:
+        cfg["gamma_stride"] = args.gamma_stride
     if args.max_epochs is not None:
         cfg["max_epochs"] = args.max_epochs
     if args.seeds is not None:
@@ -176,11 +189,18 @@ def main():
     print(f"excluded: {prep.excluded}")
     print(f"prepare done in {time.time()-t0:.1f}s | seeds={seeds} | strides={cfg['stride']}")
 
+    # TRAIN-only inter-station correlation prior for GAMMA's spatial graph (no coordinates exist).
+    adj_prior = inter_station_corr(prep.arrays["train"])
+    use_anchor = bool(cfg.get("use_anchor", True))
+    print(f"anchor (persistence residual) for all models: {use_anchor}")
+
     roster = args.models.split(",") if args.models else ROSTER
     all_summary, pm25_by_model, params, valloss = {}, {}, {}, {}
     for name in roster:
         print(f"\n== {name} ({len(seeds)} seeds) ==")
-        summ, pm25, npar, vls = train_and_eval_model(name, prep, cfg, seeds, device)
+        gk = {"adj_prior": adj_prior} if is_gamma(name) else None
+        summ, pm25, npar, vls = train_and_eval_model(name, prep, cfg, seeds, device,
+                                                     gamma_kwargs=gk, use_anchor=use_anchor)
         all_summary[name] = summ; pm25_by_model[name] = pm25; params[name] = npar; valloss[name] = vls
 
     print("\n== naive floors ==")
@@ -198,17 +218,31 @@ def main():
         print("\n== GAMMA ablations ==")
         abl_seeds = seeds[:max(1, min(3, len(seeds)))]
         for vname, kw in ABLATIONS.items():
+            gkw, abl_anchor = split_ablation(kw)
+            gkw = {**gkw, "adj_prior": adj_prior}
             print(f"-- {vname} ({len(abl_seeds)} seeds) --")
-            summ, _, npar, _ = train_and_eval_model("GAMMA", prep, cfg, abl_seeds, device, gamma_kwargs=kw)
+            summ, abl_pm25, npar, _ = train_and_eval_model(
+                "GAMMA", prep, cfg, abl_seeds, device, gamma_kwargs=gkw, use_anchor=abl_anchor)
             ablation_summary[vname] = {"summary": summ, "n_params": npar}
+            pm25_by_model[vname] = abl_pm25      # for the staleness-stratified capability analysis
+
+    # ---- staleness-stratified capability analysis (the uniquely-GAMMA story) ----
+    from .evaluate import staleness_strata
+    strata = {}
+    if "GAMMA" in roster:
+        strata = staleness_strata(pm25_by_model, cfg["horizons"], cfg["seq_len"],
+                                  set(BASELINES.keys()),
+                                  edges=tuple(cfg.get("staleness_bins", [1, 6])))
 
     # ---- persist ----
     payload = {
         "stations": prep.stations, "excluded": prep.excluded, "seeds": seeds,
         "config": {k: cfg[k] for k in ("seq_len", "horizons", "quantiles", "stride", "max_epochs", "d_model")},
+        "use_anchor": use_anchor,
         "params": params, "val_loss": valloss,
         "summary": all_summary, "ablations": ablation_summary,
         "dm": {str(h): {"dm": v["dm"], "holm": v["holm"]} for h, v in dm.items()},
+        "stratified": strata,
     }
     with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=float)
